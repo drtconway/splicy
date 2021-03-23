@@ -4,6 +4,7 @@
 Usage:
     splicy count [options] [<bam>...]
     splicy annotate [options] <annotation> <junction-counts>
+    splicy summarise [options] <annotated-counts>
 
 Options:
     -s NAMES, --sample-names NAMES      comma separated list of sample names.
@@ -342,7 +343,46 @@ def main(args):
                     if len(cls) >= 3:
                         extraName = cls[2]
                     print(f"{sn}\t{chrom}\t{beg}\t{end}\t{cov}\t{cls[0]}\t{geneName}\t{extraName}", file=out)
+        return
 
+    if args['summarise']:
+        dat = {}
+
+        clss = set([])
+        with smart_open(args['<annotated-counts>'], "rt") as inp:
+            hdr = None
+            toc = {}
+            for l in inp:
+                t = l.split()
+                if hdr is None:
+                    hdr = t
+                    toc = dict(zip(hdr, range(len(hdr))))
+                    continue
+                sn = t[toc["sample"]]
+                cls = t[toc["classification"]]
+                if cls == 'unannotated' or cls == 'intergenic':
+                    continue
+                if cls not in clss:
+                    clss.add(cls)
+                gnm = t[toc["gene"]]
+                cvg = int(t[toc["coverage"]])
+                if sn not in dat:
+                    dat[sn] = {}
+                if gnm not in dat[sn]:
+                    dat[sn][gnm] = {}
+                if cls not in dat[sn][gnm]:
+                    dat[sn][gnm][cls] = 0
+                dat[sn][gnm][cls] += cvg
+
+        with smart_open(args['--output'], "wt") as out:
+            print(f"sample\tgene\tclassification\tcoverage\tfraction", file=out)
+            for sn in sorted(dat.keys()):
+                for gnm in sorted(dat[sn].keys()):
+                    tot = sum(dat[sn][gnm].values())
+                    for cls in sorted(clss):
+                        cvg = dat[sn][gnm].get(cls, 0)
+                        frc = float(cvg)/float(tot)
+                        print(f"{sn}\t{gnm}\t{cls}\t{cvg}\t{frc:.4e}", file=out)
 
 if __name__ == '__main__':
     arguments = docopt(__doc__)
