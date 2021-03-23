@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""splicy - identify genes that may have anomolous splicing
+
+Usage:
+    splicy count [options] [<bam>...]
+    splicy annotate [options] <annotation> <junction-counts>
+
+Options:
+    -s NAMES, --sample-names NAMES      comma separated list of sample names.
+    -o FILE, --output FILE              filename to write the output to. [default: -]
+"""
+import gzip
+import sys
+from docopt import docopt
+from gtfparse import read_gtf
+from intervaltree import IntervalTree, Interval
+
+class SplicyException(Exception): pass
+
+def smart_open(name, mode):
+    if name == "-":
+        if "r" in mode:
+            return sys.stdin
+        if "w" in mode:
+            return sys.stdout
+        raise SplicyException(f"unexpected mode '{mode}' for file '-'")
+    if name.endswith(".gz"):
+        return gzip.open(name, mode)
+    return open(name, mode)
+
+class annotation(object):
+    def __init__(self, annotName):
+        annot = read_gtf(annotName)
+
+        self.txIdx = {}
+        self.exonIdx = {}
+        self.exons = {}
+        self.geneIdx = {}
+        self.genes = {}
+
+        for itm in annot[annot['feature'] == 'exon'][['seqname', 'start', 'end', 'gene_id', 'transcript_id', 'exon_id', 'exon_number']].iterrows():
+            (chrom, start, stop, gene_id, transcript_id, exon_id, exon_number) = itm[1]
+            begin = start - 1
+            end = stop
+            if chrom not in self.exons:
+                self.exons[chrom] = IntervalTree()
+            self.exons[chrom][begin:end] = exon_id
+            self.exonIdx[exon_id] = (transcript_id, int(exon_number))
+            if transcript_id not in self.txIdx:
+                self.txIdx[transcript_id] = gene_id
+
+        for itm in annot[annot["feature"] == "gene"][["seqname", "start", "end", "gene_id", "gene_name"]].iterrows():
+            (chrom, start, stop, gene_id, gene_name) = itm[1]
+            begin = start - 1
+            end = stop
+            if chrom not in self.genes:
+                self.genes[chrom] = IntervalTree()
+            self.genes[chrom][begin:end] = gene_id
+            self.geneIdx[gene_id] = gene_name
+
+    def classify_junction(self, chrom, donorPos, acceptorPos):
+        if chrom not in self.exons:
+            yield ('unannotated',)
+            return
+
+        donorExs = self.exons[chrom].at(donorPos)
+        donorExsAligned = set([ex for ex in donorExs if ex.end == donorPos + 1])
+        donorTxPoss = set([self.exonIdx[ex.data] for ex in donorExsAligned])
+
+        acceptorExs = self.exons[chrom].at(acceptorPos)
+        acceptorExsAligned = set([ex for ex in acceptorExs if ex.begin == acceptorPos])
+        acceptorTxPoss = set([self.exonIdx[ex.data] for ex in acceptorExsAligned])
+
+        # See if there is at least one transcript that contains exactly this junction
+        #
+        adjacentExs = self.check_adjacency(donorTxPoss, acceptorTxPoss)
+        if len(adjacentExs) > 0:
+            for adj in sorted(adjacentExs):
+                txId = adj[0]
+                gId = self.txIdx[txId]
+                gNm = self.geneIdx[gId]
+                yield ('normal', gNm, txId)
+            return
+
+        # See if there is at least one transcript in common for the aligned end-points
+        # which would correspond to exon-skipping within the transcript
+        #
+        sameTxs = self.check_same_transcript(donorTxPoss, acceptorTxPoss)
+
+        if len(sameTxs) > 0:
+            for txId in sorted(sameTxs):
+                gId = self.txIdx[txId]
+                gNm = self.geneIdx[gId]
+                yield ('skipping', gNm, txId)
+            return
+
+        # See if there is at least one annotated donor site and one annotated acceptor site
+        # and see if they have any genes in common. If they do, then it's a hybrid transcript,
+        # and if they don't it's a fusion transcript.
+        #
+        if len(donorExsAligned) > 0 and len(acceptorExsAligned) > 0:
+            donorTxIds = set([self.exonIdx[ex.data][0] for ex in donorExsAligned])
+            donorGeneIds = set([self.txIdx[txId] for txId in donorTxIds])
+            acceptorTxIds = set([self.exonIdx[ex.data][0] for ex in acceptorExsAligned])
+            acceptorGeneIds = set([self.txIdx[txId] for txId in acceptorTxIds])
+            commonGeneIds = donorGeneIds & acceptorGeneIds
+            if len(commonGeneIds) > 0:
+                for gId in sorted(commonGeneIds):
+                    gNm = self.geneIdx[gId]
+                    for donorTxId in sorted(donorTxIds):
+                        donorGeneId = self.txIdx[donorTxId]
+                        if donorGeneId != gId:
+                            continue
+                        for acceptorTxId in sorted(acceptorTxIds):
+                            acceptorGeneId = self.txIdx[acceptorTxId]
+                            if acceptorGeneId != gId:
+                                continue
+                            yield ('hybrid', gNm, donorTxId, acceptorTxId)
+            else:
+                for donorTxId in sorted(donorTxIds):
+                    donorGeneId = self.txIdx[donorTxId]
+                    donorGeneName = self.geneIdx[donorGeneId]
+                    for acceptorTxId in sorted(acceptorTxIds):
+                        acceptorGeneId = self.txIdx[acceptorTxId]
+                        acceptorGeneName = self.geneIdx[acceptorGeneId]
+                        yield ('fusion', donorGeneName, acceptorGeneName)
+            return
+
+        # See if there is at least one annotated donor site, in which case we have
+        # a novel acceptor.
+        #
+        if len(donorExsAligned) > 0:
+            donorExIds = set([ex.data for ex in donorExsAligned])
+            donorTxIds = set([self.exonIdx[exId][0] for exId in donorExIds])
+            donorGeneIds = set([self.txIdx[txId] for txId in donorTxIds])
+            for gId in sorted(donorGeneIds):
+                geneName = self.geneIdx[gId]
+                yield ('acceptor', geneName)
+            return
+
+        # See if there is at least one annotated acceptor site, in which case we have
+        # a novel donor.
+        #
+        if len(acceptorExsAligned) > 0:
+            acceptorExIds = set([ex.data for ex in acceptorExsAligned])
+            acceptorTxIds = set([self.exonIdx[exId][0] for exId in acceptorExIds])
+            acceptorGeneIds = set([self.txIdx[txId] for txId in acceptorTxIds])
+            for gId in sorted(acceptorGeneIds):
+                geneName = self.geneIdx[gId]
+                yield ('donor', geneName)
+            return
+
+        # Ok, now we're done with annotated donor/acceptor sites, so we're looking at
+        # something with novel sites at both ends. If we have a hit on a gene from either end,
+        # we can use that to identify the gene.
+        #
+        donorExIds = set([ex.data for ex in donorExs])
+        donorTxIds = set([self.exonIdx[exId][0] for exId in donorExIds])
+        donorGeneIds = set([self.txIdx[txId] for txId in donorTxIds])
+        acceptorExIds = set([ex.data for ex in acceptorExs])
+        acceptorTxIds = set([self.exonIdx[exId][0] for exId in acceptorExIds])
+        acceptorGeneIds = set([self.txIdx[txId] for txId in acceptorTxIds])
+        
+        # If we have hits on both ends, find a gene in common.
+        #
+        commonGeneIds = donorGeneIds & acceptorGeneIds
+        if len(commonGeneIds) > 0:
+            for gId in sorted(commonGeneIds):
+                geneName = self.geneIdx[gId]
+                yield ('novel', geneName)
+            return
+
+        # If either end has hits, we can use them.
+        #
+        mergedGeneIds = donorGeneIds | acceptorGeneIds
+        if len(mergedGeneIds) > 0:
+            for gId in sorted(mergedGeneIds):
+                geneName = self.geneIdx[gId]
+                yield ('novel', geneName)
+            return
+
+        # Neither end had exon-hits, so let's try the same thing querying the gene ranges.
+        #
+        donorGeneIds = set([gint.data for gint in self.genes[chrom].at(donorPos)])
+        acceptorGeneIds = set([gint.data for gint in self.genes[chrom].at(acceptorPos)])
+
+        # If we have hits on both ends, find a gene in common.
+        #
+        commonGeneIds = donorGeneIds & acceptorGeneIds
+        if len(commonGeneIds) > 0:
+            for gId in sorted(commonGeneIds):
+                geneName = self.geneIdx[gId]
+                yield ('novel', geneName)
+            return
+
+        # If either end has hits, we can use them.
+        #
+        mergedGeneIds = donorGeneIds | acceptorGeneIds
+        if len(mergedGeneIds) > 0:
+            for gId in sorted(mergedGeneIds):
+                geneName = self.geneIdx[gId]
+                yield ('novel', geneName)
+            return
+
+        # Ok. It's an intergenic hit.
+        # For bonus marks, we should find the nearest up/down stream gene
+        #
+        yield ('intergenic',)
+
+    def check_adjacency(self, donorTxPoss, acceptorTxPoss):
+        adjacentExs = set([])
+        for (donorTx, donorExNum) in donorTxPoss:
+            for (acceptorTx, acceptorExNum) in acceptorTxPoss:
+                if donorTx != acceptorTx:
+                    continue
+                if abs(donorExNum - acceptorExNum) != 1:
+                    continue
+                adjacentExs.add((donorTx, donorExNum, acceptorExNum))
+        return adjacentExs
+
+    def check_same_transcript(self, donorTxPoss, acceptorTxPoss):
+        donorTxs = set([txPos[0] for txPos in donorTxPoss])
+        acceptorTxs = set([txPos[0] for txPos in acceptorTxPoss])
+        return donorTxs & acceptorTxs
+
+def consAnnot(annotName):
+    annot = read_gtf(annotName)
+
+    exonIdx = {}
+    exons = {}
+    for itm in annot[annot["feature"] == "exon"][["seqname", "start", "end", "gene_id", "exon_id"]].iterrows():
+        (chrom, start, stop, gene_id, exon_id) = itm[1]
+        begin = start - 1
+        end = stop
+        if chrom not in exons:
+            exons[chrom] = IntervalTree()
+        exons[chrom][begin:end] = exon_id
+        exonIdx[exon_id] = gene_id
+
+    geneIdx = {}
+    genes = {}
+    for itm in annot[annot["feature"] == "gene"][["seqname", "start", "end", "gene_id", "gene_name"]].iterrows():
+        (chrom, start, stop, gene_id, gene_name) = itm[1]
+        begin = start - 1
+        end = stop
+        if chrom not in genes:
+            genes[chrom] = IntervalTree()
+        genes[chrom][begin:end] = gene_id
+        geneIdx[gene_id] = gene_name
+
+    return (geneIdx, genes, exonIdx, exons)
+
+def marshal_bams(names, sampleNames):
+    if sampleNames is None:
+        sampleNames = []
+    else:
+        sampleNames = sampleNames.split(",")
+
+    res = []
+    for origName in names:
+        if origName.startswith("@"):
+            with open(origName[1:]) as f:
+                for l in f:
+                    t = l.split()
+                    samName = t[0]
+                    bamName = t[1]
+                    res.append((samName, bamName))
+        else:
+            bamName = origName
+            if len(sampleNames):
+                samName = sampleNames[0]
+                del sampleNames[0]
+            else:
+                samName = origName
+            res.append((samName, bamName))
+    return res
+
+def scan_bam_file(bamName):
+    import pysam
+    sam = pysam.AlignmentFile(bamName)
+    try:
+        res = {}
+        for ref in sam.references:
+            res[ref] = {}
+            junk = sam.find_introns(sam.fetch(ref))
+            for x in junk:
+                res[ref][x] = junk[x]
+        return res
+    finally:
+        sam.close()
+
+def main(args):
+    print(args)
+
+    if args['count']:
+        with smart_open(args['--output'], 'wt') as out:
+            print("sample\tchrom\tbegin\tend\tcoverage", file=out)
+            names = marshal_bams(args['<bam>'], args['--sample-names'])
+            for (nm, fn) in names:
+                junk = scan_bam_file(fn)
+                hits = {}
+                for ref in sorted(junk.keys()):
+                    for k in sorted(junk[ref].keys()):
+                        c = junk[ref][k]
+                        print(f"{nm}\t{ref}\t{k[0]}\t{k[1]}\t{c}", file=out)
+        return
+
+    if args['annotate']:
+        annotName = args['<annotation>']
+        annot = annotation(annotName)
+
+        with smart_open(args['<junction-counts>'], "rt") as inp, smart_open(args['--output'], "wt") as out:
+            hdr = None
+            toc = {}
+            print(f"sample\tchrom\tbegin\tend\tcoverage\tclassification\tgene\textra", file=out)
+            for l in inp:
+                t = l.split()
+                if hdr is None:
+                    hdr = t
+                    toc = dict(zip(hdr, range(len(hdr))))
+                    continue
+                sn = t[toc["sample"]]
+                chrom = t[toc["chrom"]]
+                beg = int(t[toc["begin"]])
+                end = int(t[toc["end"]])
+                cov = int(t[toc["coverage"]])
+
+                # The intron is a half-open interval, 0-based.
+                # To determine if a junction corresponds to annotated
+                # exons, we want to look for an exon with its last
+                # position one before the start of the junction,
+                # and an exon with its first base being one after
+                # the end of the intron.
+                donor = beg - 1
+                acceptor = end
+
+                for cls in annot.classify_junction(chrom, donor, acceptor):
+                    geneName = "NA"
+                    extraName = "NA"
+                    if len(cls) >= 2:
+                        geneName = cls[1]
+                    if len(cls) >= 3:
+                        extraName = cls[2]
+                    print(f"{sn}\t{chrom}\t{beg}\t{end}\t{cov}\t{cls[0]}\t{geneName}\t{extraName}", file=out)
+
+
+if __name__ == '__main__':
+    arguments = docopt(__doc__)
+    main(arguments)
+
+# vim: set ft=python:
