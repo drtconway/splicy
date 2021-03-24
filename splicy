@@ -29,6 +29,12 @@ def smart_open(name, mode):
         return gzip.open(name, mode)
     return open(name, mode)
 
+def union(xs):
+    r = set([])
+    for x in xs:
+        r |= x
+    return r
+
 class annotation(object):
     def __init__(self, annotName):
         annot = read_gtf(annotName)
@@ -46,7 +52,9 @@ class annotation(object):
             if chrom not in self.exons:
                 self.exons[chrom] = IntervalTree()
             self.exons[chrom][begin:end] = exon_id
-            self.exonIdx[exon_id] = (transcript_id, int(exon_number))
+            if exon_id not in self.exonIdx:
+                self.exonIdx[exon_id] = set([])
+            self.exonIdx[exon_id].add((transcript_id, int(exon_number)))
             if transcript_id not in self.txIdx:
                 self.txIdx[transcript_id] = gene_id
 
@@ -66,11 +74,11 @@ class annotation(object):
 
         donorExs = self.exons[chrom].at(donorPos)
         donorExsAligned = set([ex for ex in donorExs if ex.end == donorPos + 1])
-        donorTxPoss = set([self.exonIdx[ex.data] for ex in donorExsAligned])
+        donorTxPoss = union([self.exonIdx[ex.data] for ex in donorExsAligned])
 
         acceptorExs = self.exons[chrom].at(acceptorPos)
         acceptorExsAligned = set([ex for ex in acceptorExs if ex.begin == acceptorPos])
-        acceptorTxPoss = set([self.exonIdx[ex.data] for ex in acceptorExsAligned])
+        acceptorTxPoss = union([self.exonIdx[ex.data] for ex in acceptorExsAligned])
 
         # See if there is at least one transcript that contains exactly this junction
         #
@@ -100,9 +108,9 @@ class annotation(object):
         # and if they don't it's a fusion transcript.
         #
         if len(donorExsAligned) > 0 and len(acceptorExsAligned) > 0:
-            donorTxIds = set([self.exonIdx[ex.data][0] for ex in donorExsAligned])
+            donorTxIds = set([txPos[0] for txPos in donorTxPoss])
             donorGeneIds = set([self.txIdx[txId] for txId in donorTxIds])
-            acceptorTxIds = set([self.exonIdx[ex.data][0] for ex in acceptorExsAligned])
+            acceptorTxIds = set([txPos[0] for txPos in acceptorTxPoss])
             acceptorGeneIds = set([self.txIdx[txId] for txId in acceptorTxIds])
             commonGeneIds = donorGeneIds & acceptorGeneIds
             if len(commonGeneIds) > 0:
@@ -132,7 +140,8 @@ class annotation(object):
         #
         if len(donorExsAligned) > 0:
             donorExIds = set([ex.data for ex in donorExsAligned])
-            donorTxIds = set([self.exonIdx[exId][0] for exId in donorExIds])
+            donorTxPoss = union([self.exonIdx[exId] for exId in donorExIds])
+            donorTxIds = set([txPos[0] for txPos in donorTxPoss])
             donorGeneIds = set([self.txIdx[txId] for txId in donorTxIds])
             for gId in sorted(donorGeneIds):
                 geneName = self.geneIdx[gId]
@@ -144,7 +153,8 @@ class annotation(object):
         #
         if len(acceptorExsAligned) > 0:
             acceptorExIds = set([ex.data for ex in acceptorExsAligned])
-            acceptorTxIds = set([self.exonIdx[exId][0] for exId in acceptorExIds])
+            acceptorTxPoss = union([self.exonIdx[exId] for exId in acceptorExIds])
+            acceptorTxIds = set([txPos[0] for txPos in acceptorTxPoss])
             acceptorGeneIds = set([self.txIdx[txId] for txId in acceptorTxIds])
             for gId in sorted(acceptorGeneIds):
                 geneName = self.geneIdx[gId]
@@ -156,10 +166,12 @@ class annotation(object):
         # we can use that to identify the gene.
         #
         donorExIds = set([ex.data for ex in donorExs])
-        donorTxIds = set([self.exonIdx[exId][0] for exId in donorExIds])
+        donorTxPoss = union([self.exonIdx[exId] for exId in donorExIds])
+        donorTxIds = set([txPos[0] for txPos in donorTxPoss])
         donorGeneIds = set([self.txIdx[txId] for txId in donorTxIds])
         acceptorExIds = set([ex.data for ex in acceptorExs])
-        acceptorTxIds = set([self.exonIdx[exId][0] for exId in acceptorExIds])
+        acceptorTxPoss = union([self.exonIdx[exId] for exId in acceptorExIds])
+        acceptorTxIds = set([txPos[0] for txPos in acceptorTxPoss])
         acceptorGeneIds = set([self.txIdx[txId] for txId in acceptorTxIds])
         
         # If we have hits on both ends, find a gene in common.
@@ -341,7 +353,7 @@ def main(args):
                     if len(cls) >= 2:
                         geneName = cls[1]
                     if len(cls) >= 3:
-                        extraName = cls[2]
+                        extraName = ','.join(cls[2:])
                     print(f"{sn}\t{chrom}\t{beg}\t{end}\t{cov}\t{cls[0]}\t{geneName}\t{extraName}", file=out)
         return
 
